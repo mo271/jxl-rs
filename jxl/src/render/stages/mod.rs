@@ -5,8 +5,9 @@
 
 mod chroma_upsample;
 mod convert;
-mod save;
 mod identity;
+mod pixel_art;
+mod save;
 
 pub use chroma_upsample::*;
 pub use convert::*;
