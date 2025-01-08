@@ -93,14 +93,14 @@ impl PatchBlendMode {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct PatchBlending {
     mode: PatchBlendMode,
     alpha_channel: usize,
     clamp: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PatchReferencePosition {
     // Not using `ref` like in the spec here, because it is a keyword.
     reference: usize,
@@ -117,7 +117,7 @@ pub struct PatchPosition {
     ref_pos_idx: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub struct PatchesDictionary {
     pub positions: Vec<PatchPosition>,
     ref_positions: Vec<PatchReferencePosition>,

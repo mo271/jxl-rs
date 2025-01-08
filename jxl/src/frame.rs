@@ -190,8 +190,9 @@ impl Frame {
         assert!(self.lf_global.is_none());
         trace!(pos = br.total_bits_read());
 
+        println!("not yet decoding patches: {:?}", self.header.has_patches());
         let patches = if self.header.has_patches() {
-            info!("decoding patches");
+            println!("decoding patches");
             Some(PatchesDictionary::read(
                 br,
                 self.header.width as usize,
@@ -288,7 +289,7 @@ mod test {
         bit_reader::BitReader,
         container::ContainerParser,
         error::Error,
-        features::spline::Point,
+        features::{patches::PatchesDictionary, spline::Point},
         headers::{FileHeader, JxlHeader},
         util::test::assert_almost_eq,
     };
@@ -304,7 +305,10 @@ mod test {
         let file_header = FileHeader::read(&mut br).unwrap();
         let mut decoder_state = DecoderState::new(file_header);
         loop {
+            println!("reading a frame");
             let mut frame = Frame::new(&mut br, decoder_state)?;
+            println!("read a frame");
+            println!("decoder state. ref_frames: {:?}", frame.decoder_state.reference_frames);
             let mut sections = frame.sections(&mut br)?;
             frame.decode_lf_global(&mut sections[frame.get_section_idx(Section::LfGlobal)])?;
 
@@ -441,14 +445,25 @@ mod test {
     #[test]
     #[ignore = "WP and reference properties are not implemented yet"]
     fn patches() -> Result<(), Error> {
-        let mut frames = Vec::new();
         read_frames(
-            include_bytes!("../resources/test/grayscale_patches_modular.jxl"),
+            include_bytes!("../resources/test/small_grayscale_patches_modular.jxl"),
             |frame| {
-                frames.push(frame);
-                Ok(None)
+
+                let lf_global = frame.lf_global.as_ref().unwrap();
+                match &lf_global.patches {
+                    None => (),
+                    Some(patches) => {
+                    let want_patches = PatchesDictionary::default();
+                    assert_eq!(*patches, want_patches);
+                    }
+                }
+                assert!(lf_global.patches.is_none());
+                frame.finalize()
             },
         )?;
+        //let patches = lf_global.patches.as_ref().unwrap();
+       // let want_patches = PatchesDictionary::default();
+       // assert_eq!(*patches, want_patches);
         // TODO(firsching) add test for patches
         Ok(())
     }
