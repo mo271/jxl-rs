@@ -100,15 +100,15 @@ enum BlendingMode {
     Mul = 4,
 }
 
-struct BlendingInfoNonserialized {
-    num_extra_channels: u32,
-    have_crop: bool,
-    x0: i32,
-    y0: i32,
-    width: u32,
-    height: u32,
-    img_width: u32,
-    img_height: u32,
+pub struct BlendingInfoNonserialized {
+    pub num_extra_channels: u32,
+    pub have_crop: bool,
+    pub x0: i32,
+    pub y0: i32,
+    pub width: u32,
+    pub height: u32,
+    pub img_width: u32,
+    pub img_height: u32,
 }
 
 #[derive(UnconditionalCoder, Debug, PartialEq, Clone)]
@@ -130,6 +130,13 @@ struct BlendingInfo {
     #[condition(nonserialized.num_extra_channels > 0 &&
         (mode == BlendingMode::Blend || mode == BlendingMode::AlphaWeightedAdd || mode == BlendingMode::Mul))]
     clamp: bool,
+
+    #[default(
+        nonserialized.x0 > 0 || nonserialized.y0 > 0 ||
+        ((nonserialized.width as i64 + nonserialized.x0 as i64) < nonserialized.img_width as i64) ||
+        ((nonserialized.height as i64 + nonserialized.y0 as i64) < nonserialized.img_height as i64))]
+    #[condition(false)]
+    is_partial_frame: bool,
 
     #[coder(u2S(0, 1, 2, 3))]
     #[default(0)]
