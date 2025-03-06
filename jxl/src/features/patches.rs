@@ -10,12 +10,35 @@ use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
 
 use crate::{
-    bit_reader::BitReader,
-    entropy_coding::decode::Histograms,
-    error::{Error, Result},
-    frame::DecoderState,
-    util::{tracing_wrappers::*, NewWithCapacity},
+    bit_reader::BitReader, entropy_coding::decode::Histograms, error::{Error, Result}, frame::DecoderState, render::{RenderPipelineInPlaceStage, RenderPipelineStage}, util::{tracing_wrappers::*, NewWithCapacity}
 };
+
+pub struct PatchesStage {
+    patches: PatchesDictionary,
+}
+
+impl std::fmt::Display for PatchesStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "patches")
+    }
+}
+
+impl RenderPipelineStage for PatchesStage {
+    type Type = RenderPipelineInPlaceStage<f32>;
+
+    fn uses_channel(&self, c: usize) -> bool {
+        c < 3
+    }
+
+    fn process_row_chunk(
+        &mut self,
+        position: (usize, usize),
+        xsize: usize,
+        row: &mut [&mut [f32]],
+    ) {
+        self.patches.add_one_row(row, position, xsize);
+    }
+}
 
 // Context numbers as specified in Section C.4.5, Listing C.2:
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -117,15 +140,140 @@ pub struct PatchPosition {
     ref_pos_idx: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct PatchTreeNode {
+    left_child: isize,
+    right_child: isize,
+    y_center: usize,
+    start: usize,
+    num: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct PatchesDictionary {
     pub positions: Vec<PatchPosition>,
     ref_positions: Vec<PatchReferencePosition>,
     blendings: Vec<PatchBlending>,
     blendings_stride: usize,
+    patch_tree: Vec<PatchTreeNode>,
+    // Number of patches for each row.
+    num_patches: Vec<usize>,
+    sorted_patches_y0: Vec<(usize, usize)>,
+    sorted_patches_y1: Vec<(usize, usize)>,
 }
 
 impl PatchesDictionary {
+
+    fn compute_patch_tree(&mut self) {
+        #[derive(Debug, Clone, Copy)]
+        struct PatchInterval {
+            idx: usize,
+            y0: usize,
+            y1: usize,
+        }
+
+        self.patch_tree.clear();
+        self.num_patches.clear();
+        self.sorted_patches_y0.clear();
+        self.sorted_patches_y1.clear();
+
+        if self.positions.is_empty() {
+            return;
+        }
+
+        // Create a y-interval for each patch.
+        let mut intervals: Vec<PatchInterval> = Vec::with_capacity(self.positions.len());
+        for (i, pos) in self.positions.iter().enumerate() {
+            intervals.push(PatchInterval {
+                idx: i,
+                y0: pos.y,
+                y1: pos.y + self.ref_positions[pos.ref_pos_idx].ysize,
+            });
+        }
+
+        let mut sort_by_y0 = |start: usize, end: usize| {
+            intervals[start..end].sort_unstable_by_key(|i| i.y0);
+        };
+        let mut sort_by_y1 = |start: usize, end: usize| {
+            intervals[start..end].sort_unstable_by_key(|i| i.y1);
+        };
+
+        // Count the number of patches for each row.
+        sort_by_y1(0, intervals.len());
+        self.num_patches.resize(intervals.last().map_or(0, |iv| iv.y1), 0); //Safe last()
+        for iv in &intervals {
+            for y in iv.y0..iv.y1 {
+                self.num_patches[y] += 1;
+            }
+        }
+
+        let mut root = PatchTreeNode::default();
+        root.start = 0;
+        root.num = intervals.len();
+        self.patch_tree.push(root);
+
+        let mut next = 0;
+        while next < self.patch_tree.len() {
+            let node = &mut self.patch_tree[next]; // Borrow mutably *before* accessing fields
+            let start = node.start;
+            let end = node.start + node.num;
+
+            // Choose the y_center for this node to be the median of interval starts.
+            sort_by_y0(start, end);
+            let middle_idx = start + node.num / 2;
+            node.y_center = intervals[middle_idx].y0;
+
+            // Divide the intervals in [start, end) into three groups:
+            let mut right_start = middle_idx;
+            while right_start < end && intervals[right_start].y0 == node.y_center {
+                right_start += 1;
+            }
+
+            sort_by_y1(start, right_start);
+            let mut left_end = right_start;
+            while left_end > start && intervals[left_end - 1].y1 > node.y_center {
+                left_end -= 1;
+            }
+
+            // Fill in sorted_patches_y0_ and sorted_patches_y1_ for the current node.
+            node.num = right_start - left_end;
+            node.start = self.sorted_patches_y0.len();
+
+            for i in (left_end..right_start).rev() {
+                self.sorted_patches_y1
+                    .push((intervals[i].y1, intervals[i].idx));
+            }
+            sort_by_y0(left_end, right_start);
+            for i in left_end..right_start {
+                self.sorted_patches_y0
+                    .push((intervals[i].y0, intervals[i].idx));
+            }
+
+            // Create the left and right nodes (if not empty).
+            // We modify left_child/right_child on the *original* node in patch_tree,
+            // so we have to do the assignment *before* we push the new nodes.
+            self.patch_tree[next].left_child = -1;
+            self.patch_tree[next].right_child = -1;
+
+            if left_end > start {
+                let mut left = PatchTreeNode::default();
+                left.start = start;
+                left.num = left_end - left.start;
+                self.patch_tree[next].left_child = self.patch_tree.len() as isize;
+                self.patch_tree.push(left);
+            }
+            if right_start < end {
+                let mut right = PatchTreeNode::default();
+                right.start = right_start;
+                right.num = end - right.start;
+                self.patch_tree[next].right_child = self.patch_tree.len() as isize;
+                self.patch_tree.push(right);
+            }
+
+            next += 1;
+        }
+    }
+
     #[instrument(level = "debug", skip(br), ret, err)]
     pub fn read(
         br: &mut BitReader,
@@ -333,11 +481,77 @@ impl PatchesDictionary {
                 ysize: ref_pos_ysize,
             })
         }
-        Ok(PatchesDictionary {
+
+        let mut patches_dict =
+        PatchesDictionary {
             positions,
             blendings,
             ref_positions,
             blendings_stride,
-        })
+            num_patches: vec![],
+            sorted_patches_y0: vec![],
+            sorted_patches_y1: vec![],
+            patch_tree: vec![],
+        };
+        patches_dict.compute_patch_tree();
+        Ok(patches_dict)
+    }
+
+    pub fn get_patches_for_row(&self, y: usize) -> Vec<usize> {
+        let mut result = vec![];
+        if self.num_patches.len() <= y || self.num_patches[y] == 0 {
+            return result;
+        }
+
+        result.reserve(self.num_patches[y]); //  Reserve space as in C++
+
+        let mut tree_idx: isize = 0;
+        loop {
+            if tree_idx == -1 {
+                break;
+            }
+
+            // Safe access using get() and unwrap_or().  No need for the assert.
+            let node = self.patch_tree.get(tree_idx as usize).unwrap_or_else(|| {
+                // TODO(firsching): Handle panic differently?
+                panic!("Invalid tree_idx: {}", tree_idx);
+            });
+
+
+            if y <= node.y_center {
+                for i in 0..node.num {
+                    let p = self.sorted_patches_y0[node.start + i];
+                    if y < p.0 {
+                        break;
+                    }
+                    result.push(p.1);
+                }
+                tree_idx = if y < node.y_center {
+                    node.left_child
+                } else {
+                    -1
+                };
+            } else {
+                for i in 0..node.num {
+                    let p = self.sorted_patches_y1[node.start + i];
+                    if y >= p.0 {
+                        break;
+                    }
+                    result.push(p.1);
+                }
+                tree_idx = node.right_child;
+            }
+        }
+
+        // Ensure that the relative order of patches is preserved.
+        result.sort();
+        result
+    }
+
+
+
+
+    pub fn add_one_row(&self, row: &mut [&mut [f32]], position: (usize, usize), xsize: usize) {
+
     }
 }
